@@ -11,45 +11,60 @@ import fi.oph.koski.schema.Henkilö.Oid
 import fi.oph.koski.util.Timing
 import org.json4s.JValue
 
-class KoskiScheduledTasks(application: KoskiApplication) extends Timing {
+class KoskiScheduledTasks(application: KoskiApplication) {
   val updateHenkilötScheduler: Scheduler = new UpdateHenkilot(application).scheduler
 }
 
 class UpdateHenkilot(application: KoskiApplication) extends Timing {
-  def scheduler = new Scheduler(application.database.db, "henkilötiedot-update", new IntervalSchedule(henkilötiedotUpdateInterval), henkilöUpdateContext(changedHenkilösSince), updateHenkilöt)
+  def scheduler = new Scheduler(application.database.db, "henkilötiedot-update", new IntervalSchedule(henkilötiedotUpdateInterval), henkilöUpdateContext(currentTimeMillis), updateHenkilöt)
 
   def updateHenkilöt(context: Option[JValue]): Option[JValue] = timed("scheduledHenkilötiedotUpdate") {
     implicit val formats = Json.jsonFormats
-    val start = changedHenkilösSince
-    val oldContext = context.get.extract[HenkilöUpdateContext]
-
     try {
-      val (henkilöTauluCount, elasticCount) = runUpdate(oldContext)
-      logger.info(s"Updated $henkilöTauluCount entries to henkilö table and $elasticCount to elasticsearch")
-      henkilöUpdateContext(start)
+      val oldContext = context.get.extract[HenkilöUpdateContext]
+      val startMillis = currentTimeMillis
+      val kaikkiMuuttuneet = application.authenticationServiceClient.findChangedOppijaOids(oldContext.lastRun)
+      val initial: Either[HenkilöUpdateContext, HenkilöUpdateContext] = Right(oldContext)
+      val newContext = kaikkiMuuttuneet.sliding(1000, 1000).foldLeft(initial) { (ctx, oids) =>
+        ctx.right.flatMap(ctx => runUpdate(oids, startMillis, ctx)) // stops updating if "left" occurs
+      }.fold(identity, identity)
+      Some(Json.toJValue(newContext))
     } catch {
       case e: Exception =>
-        logger.error(e)("Problem running scheduledHenkilötiedotUpdate")
-        Some(Json.toJValue(oldContext))
+        logger.error(e)
+        context
     }
   }
 
-  private def runUpdate(oldContext: HenkilöUpdateContext) = {
-    val kaikkiMuuttuneet: List[Oid] = application.authenticationServiceClient.findChangedOppijaOids(oldContext.lastRun)
-    val (henkilöTauluCounts, elasticCounts) = kaikkiMuuttuneet.sliding(1000, 1000).map { oids: List[Oid] =>
-      val muuttuneet: Map[Oid, OppijaHenkilö] = application.authenticationServiceClient.findOppijatByOids(oids).groupBy(_.oidHenkilo).mapValues(_.head)
-      val muuttuneidenOidit: List[Oid] = muuttuneet.values.map(_.toNimitiedotJaOid).filter(o => application.henkilöCacheUpdater.updateHenkilöAction(o) > 0).map(_.oid).toList
-      val muuttuneidenHenkilötiedot: List[Henkilötiedot] = application.perustiedotRepository.findHenkiloPerustiedotByOids(muuttuneidenOidit).map(p => Henkilötiedot(p.id, muuttuneet(p.henkilö.oid).toNimitiedotJaOid))
-      val updatedToElastic = application.perustiedotRepository.updateBulk(muuttuneidenHenkilötiedot, insertMissing = false) match {
-        case Right(updatedCount) => updatedCount
-        case Left(HttpStatus(_, errors)) => throw new Exception(s"Couldn't update data to elasticsearch ${errors.mkString}")
-      }
-      (muuttuneidenOidit.length, updatedToElastic)
-    }.toList.unzip
-    (henkilöTauluCounts.sum, elasticCounts.sum)
+  private def runUpdate(oids: List[Oid], startMillis: Long, lastContext: HenkilöUpdateContext): Either[HenkilöUpdateContext, HenkilöUpdateContext] = try {
+    updateKoskiHenkilöt(oids, startMillis)
+  } catch {
+    case e: Exception =>
+      logger.error(e)("Problem running scheduledHenkilötiedotUpdate")
+      Left(lastContext)
   }
 
-  private def changedHenkilösSince = currentTimeMillis - 10 * 1000 // 10 seconds before now
+  private def updateKoskiHenkilöt(oids: List[Oid], startMillis: Long) = {
+    val oppijat: List[OppijaHenkilö] = application.authenticationServiceClient.findOppijatByOids(oids).sortBy(_.modified) // TODO: sorting should be unnecessary, verify
+    val oppijatByOid: Map[Oid, OppijaHenkilö] = oppijat.groupBy(_.oidHenkilo).mapValues(_.head)
+    val koskeenPäivitetyt: List[Oid] = oppijat.map(_.toNimitiedotJaOid).filter(o => application.henkilöCacheUpdater.updateHenkilöAction(o) > 0).map(_.oid)
+    val lastModified = oppijat.lastOption.map(_.modified).getOrElse(startMillis)
+
+    if (koskeenPäivitetyt.isEmpty) {
+      Right(HenkilöUpdateContext(lastModified))
+    } else {
+      val muuttuneidenHenkilötiedot: List[Henkilötiedot] = application.perustiedotRepository.findHenkiloPerustiedotByOids(koskeenPäivitetyt).map(p => Henkilötiedot(p.id, oppijatByOid(p.henkilö.oid).toNimitiedotJaOid))
+      application.perustiedotRepository.updateBulk(muuttuneidenHenkilötiedot, insertMissing = false) match {
+        case Right(updatedCount) => updatedCount
+          logger.info(s"Updated ${koskeenPäivitetyt.length} entries to henkilö table and $updatedCount to elasticsearch, latest oppija modified timestamp: $lastModified")
+          Right(HenkilöUpdateContext(lastModified))
+        case Left(HttpStatus(_, errors)) =>
+          logger.error(s"Couldn't update data to elasticsearch ${errors.mkString}")
+          Left(HenkilöUpdateContext(oppijatByOid(koskeenPäivitetyt.head).modified - 1000))
+      }
+    }
+  }
+
   private def henkilöUpdateContext(lastRun: Long) = Some(Json.toJValue(HenkilöUpdateContext(lastRun)))
   private def henkilötiedotUpdateInterval = application.config.getDuration("schedule.henkilötiedotUpdateInterval")
 }
